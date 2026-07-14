@@ -1,7 +1,7 @@
 # app.py
 # 這是整個模型的Streamlit介面 全程手動觸發 沒有排程
 # 分成兩個部分
-# 第一部分是候選ETF總覽 顯示candidates檔案裡的所有ETF 按照ETF類別分類顯示
+# 第一部分是候選ETF總覽 顯示candidates檔案裡的ETF 按照ETF類別分類顯示
 # 第二部分是每日分析 按下按鈕後 對這些ETF抓最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前十名
 
 import streamlit as st
@@ -14,10 +14,6 @@ import glob
 from datetime import datetime
 
 # ---------------- 參數設定 ----------------
-# candidates檔名現在會依照rebound_ranking.py最終篩選出的ETF數量變動 例如candidates_87.csv或candidates_100.csv
-# 這裡改成用glob去找目前資料夾裡所有符合candidates_*.csv格式的檔案 抓最後修改時間最新的那一個來用
-CANDIDATES_GLOB_PATTERN = "candidates_*.csv"
-
 # 資料存放資料夾 每次按下分析鍵抓到的最新資料會存在這裡
 DATA_DIR = r"C:\Users\flyin\OneDrive\桌面\新代碼\Rebound Stock Selection Model\data"
 
@@ -27,33 +23,34 @@ TOP_N_DAILY = 10
 st.set_page_config(page_title="ETF反彈選股模型", layout="wide")
 
 
-# ---------------- 找出最新的candidates檔案 ----------------
-def _find_latest_candidates_path():
+# ---------------- 找出candidates檔案 ----------------
+def _find_candidates_file():
     """
-    在目前資料夾裡搜尋所有符合candidates_*.csv格式的檔案
-    舉例 資料夾裡同時有candidates_87.csv和candidates_100.csv 會取最後修改時間比較新的那一個
-    如果找不到任何符合的檔案就回傳None 讓上層去處理錯誤訊息
+    找出目前資料夾裡的candidates檔案
+    因為rebound_ranking.py現在會依照通過低波動率定義並完成grid search的實際股票數量來命名檔案
+    例如candidates_100.csv或candidates_87.csv 檔名不再固定
+    這裡抓資料夾裡符合candidates_開頭的csv檔 如果有多個就取最新修改的那個
     """
-    matched_files = glob.glob(CANDIDATES_GLOB_PATTERN)
+    matches = glob.glob("candidates_*.csv")
 
-    if not matched_files:
-        return None
+    if not matches:
+        raise FileNotFoundError("找不到candidates檔案 請先執行rebound_ranking.py產生結果")
 
-    latest_path = max(matched_files, key=os.path.getmtime)
-    return latest_path
+    matches.sort(key=os.path.getmtime, reverse=True)
+    return matches[0]
 
 
 # ---------------- 讀取候選ETF清單 ----------------
 @st.cache_data
-def load_candidates(candidates_path):
+def load_candidates():
     """
     讀取grid search算好的candidates檔案
     這個檔案裡每一列是一支ETF 包含它專屬的trigger_zscore(觸發區間下界) optimal_days(最佳持有天數)等參數
     return_mean和return_std都是已經過濾掉極端值之後算出來的統計基準
-    candidates_path當作快取key的一部分 檔名換了就會重新讀取 不會用到舊的快取
     """
-    df = pd.read_csv(candidates_path)
-    return df
+    path = _find_candidates_file()
+    df = pd.read_csv(path)
+    return df, path
 
 
 # ---------------- 對單一ETF抓最新資料並計算今天的z_score ----------------
@@ -187,21 +184,15 @@ def main():
     st.title("ETF反彈選股模型")
     st.caption("手動觸發 不會自動排程執行")
 
-    candidates_path = _find_latest_candidates_path()
-
-    if candidates_path is None:
-        st.error(f"找不到符合 {CANDIDATES_GLOB_PATTERN} 格式的檔案 請先執行 rebound_ranking.py 產生候選清單")
-        return
-
-    st.caption(f"目前讀取的候選清單檔案 {candidates_path}")
-    candidates_df = load_candidates(candidates_path)
+    candidates_df, candidates_path = load_candidates()
 
     tab1, tab2 = st.tabs(["候選ETF總覽", "每日分析"])
 
     # ---- 分頁一 候選ETF總覽 ----
     with tab1:
         st.subheader(f"候選ETF池 共 {len(candidates_df)} 支")
-        st.caption("排名依據best_rebound_ratio 來自過去10年歷史資料 已過濾極端值與低波動率定義 不會隨最新股價變動")
+        st.caption(f"讀取自 {candidates_path}")
+        st.caption("先通過低波動率定義篩選 再依best_rebound_ratio排序 來自過去10年歷史資料 已過濾極端值 不會隨最新股價變動")
 
         categories = sorted(candidates_df["category"].dropna().unique())
 

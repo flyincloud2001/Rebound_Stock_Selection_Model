@@ -1,13 +1,14 @@
 # rebound_ranking.py
 # 這支程式是整個模型最重的一次性運算 只需要在universe.csv更新後手動重跑
-# 對universe.csv裡的每支ETF 先做低波動率定義篩選 只留下真正適合這個反彈策略的ETF
-# 低波動率定義是兩個條件同時成立 平均成交量至少達到MIN_VOLUME 年化波動率落在MIN_VOLATILITY到VOLATILITY_THRESHOLD之間
-# 舉例 XID.TO和DTRE雖然年化波動率在合理範圍內 但平均日成交量只有幾千股 流動性太差 會被排除
-# 舉例 DLR.TO是追蹤美元對加幣匯率的貨幣型ETF 年化波動率只有0.0657 明顯低於MIN_VOLATILITY 也會被排除
-# 通過篩選的ETF才會進入grid search 找出讓best_rebound_ratio最大的專屬觸發門檻(trigger_zscore)和最佳持有天數(optimal_days)
-# 如果通過篩選並且grid search成功的ETF數量少於100支 就把這些全部存起來 不用再篩一次
-# 如果數量達到100支以上 就按照best_rebound_ratio排序取前100名 這部分邏輯跟原本完全一樣
-# 輸出檔名會依照最終存進去的ETF數量命名 例如87支就存成candidates_87.csv 100支以上一律存成candidates_100.csv
+# 第一步先用低波動率定義對universe.csv做預篩選 只留下真正廣泛分散 沒有槓桿反向 沒有限定單一國家或產業的ETF
+# 第二步對通過預篩選的ETF各自做grid search
+# 找出讓best_rebound_ratio最大的專屬觸發門檻(trigger_zscore)和最佳持有天數(optimal_days)
+# 波動率篩選也在grid search這一步做 用的是過去10年的資料 不是ETF上市以來的全部資料
+# 這樣可以排除掉ETF剛上市那幾年通常比較不穩定 不確定性較高的時期
+# 最後把通過的ETF按照best_rebound_ratio排序
+# 如果通過低波動率定義並完成grid search的ETF不到100支 就把這些全部存起來 檔名依照實際數量命名
+# 如果超過100支 就照原本的邏輯只取前100名
+# 這個排名不會隨著最新股價變動 因為是根據過去10年全部歷史資料算出來的 不是這幾天的資料
 
 import pandas as pd
 import numpy as np
@@ -21,24 +22,18 @@ LOOKBACK_YEARS = 10
 # 最佳持有天數的搜尋範圍 這裡搜尋1到3天 找下跌後第幾天賣出反彈報酬最高
 DAYS_MAX = 3
 
-# 觸發門檻(z_score)的搜尋範圍 對齊ETF_test.py的np.arange(1, 4, 0.5)
+# 觸發門檻(z_score)的搜尋範圍
 # 舉例 觸發門檻是2 代表只挑z_score落在負的3(不含)到負的2(含)這個區間的日子 不是門檻以下全部累加
+# 這個grid乘以DAYS_MAX共6乘3等於18種組合 每支ETF都會逐一試過這18組 取best_rebound_ratio最高的那一組
 TRIGGER_ZSCORE_GRID = [1, 1.5, 2, 2.5, 3, 3.5]
 
 # 最少事件數 一個觸發門檻區間如果篩出的下跌事件少於這個數字就不採用
 # 這是為了避免用只發生兩三次的極端事件去推論一個穩定的專屬參數 造成過度配適
 MIN_EVENTS = 8
 
-# ---- 低波動率定義 兩個條件同時成立才算通過 ----
-# 平均日成交量門檻 用來排除XID.TO DTRE這種流動性太差的ETF
-# 舉例 XID.TO過去10年平均日成交量只有2826股 遠低於這個門檻 會被排除
-MIN_VOLUME = 100000
-
-# 年化波動率下限 用來排除DLR.TO這種貨幣或現金類ETF 這種ETF價格幾乎不太會有劇烈下跌後反彈的事件
-# 舉例 DLR.TO的年化波動率是0.0657 低於這個下限 會被排除
-MIN_VOLATILITY = 0.10
-
-# 年化波動率上限 用來排除槓桿或反向這類波動過於劇烈的ETF 沿用原本的定義
+# 年化波動率門檻 這是grid search這一步的最後一道保險 用過去10年的收盤對收盤報酬計算
+# 舉例 某支ETF過去10年日報酬的年化標準差是0.75 代表75% 會被排除
+# 這道門檻通過率會被低波動率定義預篩選機制擋掉大部分不合適的ETF 這裡只是留一道保險
 VOLATILITY_THRESHOLD = 0.6
 
 # 極端值過濾門檻 初步z_score絕對值超過這個數字的日期會被排除 不參與統計基準的計算
@@ -46,17 +41,62 @@ VOLATILITY_THRESHOLD = 0.6
 # 排除後用剩下的資料重新算一次mean和std 這組修正過的統計基準才會拿去用在grid search和每日分析
 EXTREME_Z_THRESHOLD = 4
 
-# 最終最多取排名前幾名的ETF 如果通過篩選並且grid search成功的數量少於這個數字 就全部保留不做篩選
+# 最終取排名前幾名的ETF 如果通過的ETF不到這個數字 就全部保留
 TOP_N = 100
 
-# 輸入檔案路徑
-UNIVERSE_PATH = "universe.csv"
+# ---------------- 低波動率定義 ----------------
+# 這個定義是實際比對SPY VOO QQQ ZEB.TO(應該通過)
+# 和XID.TO DTRE DLR.TO TWM SKYY FDN TMV INDY IGV(應該被排除)這13支ETF的yfinance資料後歸納出來的
+
+# 白名單分類 這些都是美股廣泛分散 沒有槓桿 沒有反向 沒有限定單一國家或產業的晨星分類
+# 舉例 SPY的category是"Large Blend" QQQ的category是"Large Growth" 兩個都在這個清單裡 算通過
+# SKYY的category是"Technology" INDY的category是"India Equity" 都不在清單裡 算不通過
+ALLOWED_CATEGORIES = {
+    "Large Blend", "Large Growth", "Large Value",
+    "Mid-Cap Blend", "Mid-Cap Growth", "Mid-Cap Value",
+    "Small Blend", "Small Growth", "Small Value"
+}
+
+# beta3Year的容許範圍 這是給category查不到的股票用的備用判斷
+# 加拿大上市的ETF在yfinance裡常常查不到category(顯示None) 例如ZEB.TO XID.TO DLR.TO都是這樣
+# 這時候改看beta3Year 也就是3年期貝他值 代表這支基金相對大盤的波動同步程度
+# 舉例 ZEB.TO的beta3Year是1.1 落在範圍內算通過 XID.TO的beta3Year是0.26 跟大盤幾乎不同步 不通過
+# DLR.TO是貨幣ETF 根本查不到beta3Year這個欄位 直接判定不通過
+BETA_LOWER = 0.8
+BETA_UPPER = 1.3
+
+# 每次yfinance查詢之間的間隔秒數
+REQUEST_DELAY = 0.3
 
 # 進度顯示間隔
 PROGRESS_INTERVAL = 20
 
-# 每次yfinance查詢之間的間隔秒數
-REQUEST_DELAY = 0.3
+# 輸入檔案路徑
+UNIVERSE_PATH = "universe.csv"
+
+
+def passes_low_volatility_definition(symbol):
+    """
+    判斷一支股票是否符合低波動率定義
+    先看category是否落在白名單裡 如果category是None(常見於加拿大上市的ETF查不到晨星分類)
+    就改看beta3Year是否落在BETA_LOWER到BETA_UPPER之間 如果兩者都查不到 就直接判定不通過
+    """
+    try:
+        info = yf.Ticker(symbol).info
+    except Exception:
+        return False
+
+    category = info.get("category")
+
+    if category is not None:
+        return category in ALLOWED_CATEGORIES
+
+    beta = info.get("beta3Year")
+
+    if beta is None:
+        return False
+
+    return BETA_LOWER <= beta <= BETA_UPPER
 
 
 def _get_etf_category(ticker):
@@ -73,9 +113,9 @@ def _get_etf_category(ticker):
 
 def find_best_params_for_etf(symbol, listing_years):
     """
-    對單一ETF做完整的分析 包含低波動率定義篩選(成交量加波動率區間) 極端值過濾 和grid search
+    對單一ETF做完整的分析 包含波動率篩選 極端值過濾 和grid search
     回傳這支ETF的類別 專屬觸發門檻 最佳持有天數 best_rebound_ratio等欄位
-    如果沒通過低波動率定義 資料不足 或找不到符合條件的組合 回傳None
+    如果波動率超標 資料不足 或找不到符合條件的組合 回傳None
     """
     ticker = yf.Ticker(symbol)
 
@@ -88,23 +128,11 @@ def find_best_params_for_etf(symbol, listing_years):
         # 資料太少代表可能剛上市或資料有問題 直接跳過
         return None
 
-    # ---- 低波動率定義篩選 ----
-    # 平均日成交量 用來判斷流動性夠不夠
-    # 舉例 hist["Volume"]這欄位過去10年每天的成交股數 取平均就是avg_volume
-    avg_volume = hist["Volume"].mean()
-
-    # 年化波動率 用過去10年收盤對收盤的日報酬計算
+    # ---- 波動率篩選 用過去10年收盤對收盤的日報酬計算年化波動率 ----
     close_return = hist["Close"].pct_change().dropna()
     annualized_volatility = close_return.std() * np.sqrt(252)
 
-    if np.isnan(annualized_volatility) or np.isnan(avg_volume):
-        return None
-
-    # 成交量不足 或波動率超出區間(太低像貨幣ETF 或太高像槓桿反向ETF) 都不通過
-    if avg_volume < MIN_VOLUME:
-        return None
-
-    if annualized_volatility < MIN_VOLATILITY or annualized_volatility > VOLATILITY_THRESHOLD:
+    if np.isnan(annualized_volatility) or annualized_volatility > VOLATILITY_THRESHOLD:
         return None
 
     # ---- 準備grid search用的資料 ----
@@ -188,7 +216,6 @@ def find_best_params_for_etf(symbol, listing_years):
         "category": category,
         "listing_years": listing_years,
         "annualized_volatility": round(float(annualized_volatility), 4),
-        "avg_volume": round(float(avg_volume), 0),
         # 這支ETF專屬的觸發門檻和最佳持有天數 是grid search在過去10年資料裡找出的最佳區間組合
         # 注意這裡用float而不是int 因為grid裡有1.5 2.5 3.5這種非整數值 用int會被錯誤截斷成1或2
         "trigger_zscore": float(trigger_zscore),
@@ -205,14 +232,29 @@ def find_best_params_for_etf(symbol, listing_years):
 
 def main():
     universe = pd.read_csv(UNIVERSE_PATH)
-    print(f"=== 讀入母體ETF 共 {len(universe)} 支 開始逐一做低波動率定義篩選 極端值過濾與grid search ===")
-    print(f"低波動率定義 平均成交量至少{MIN_VOLUME:,}股 年化波動率介於{MIN_VOLATILITY}到{VOLATILITY_THRESHOLD}之間")
+    print(f"=== 讀入母體ETF 共 {len(universe)} 支 開始逐一檢查是否符合低波動率定義 ===")
 
-    results = []
+    passed_rows = []
 
     for i, row in universe.iterrows():
         if i % PROGRESS_INTERVAL == 0:
-            print(f"處理進度 {i}/{len(universe)}")
+            print(f"低波動率定義篩選進度 {i}/{len(universe)}")
+
+        if passes_low_volatility_definition(row["symbol"]):
+            passed_rows.append(row)
+
+        time.sleep(REQUEST_DELAY)
+
+    filtered_universe = pd.DataFrame(passed_rows).reset_index(drop=True)
+    print(f"低波動率定義篩選完成 共 {len(filtered_universe)} 支ETF通過 準備進入grid search")
+
+    print(f"=== 開始對通過低波動率定義的 {len(filtered_universe)} 支ETF做波動率篩選 極端值過濾與grid search ===")
+
+    results = []
+
+    for i, row in filtered_universe.iterrows():
+        if i % PROGRESS_INTERVAL == 0:
+            print(f"grid search進度 {i}/{len(filtered_universe)}")
 
         params = find_best_params_for_etf(row["symbol"], row["listing_years"])
 
@@ -222,26 +264,30 @@ def main():
         time.sleep(REQUEST_DELAY)
 
     result_df = pd.DataFrame(results)
-    final_count = len(result_df)
-    print(f"篩選與grid search完成 共 {final_count} 支ETF通過低波動率定義並找到有效參數組合")
+    print(f"grid search完成 共 {len(result_df)} 支ETF找到有效參數組合")
 
-    # 按照best_rebound_ratio由大到小排序 這個排名方式不管哪種情況都一樣
+    # 按照best_rebound_ratio由大到小排序 這個排名方式跟原本程式碼完全一樣
     result_df.sort_values("best_rebound_ratio", ascending=False, inplace=True)
+    result_df.reset_index(drop=True, inplace=True)
 
-    if final_count < TOP_N:
-        # 通過篩選並且grid search成功的數量不足TOP_N 全部保留 不用再篩一次
-        output_df = result_df.reset_index(drop=True)
-        output_path = f"candidates_{final_count}.csv"
+    total_found = len(result_df)
+
+    # 如果通過的股票數量不到TOP_N 就把全部通過的股票都存起來 不做裁切
+    # 如果超過TOP_N 就照原本的邏輯只取前TOP_N名
+    if total_found < TOP_N:
+        final_df = result_df.copy()
+        output_count = total_found
     else:
-        # 數量達到TOP_N以上 取前TOP_N名 跟原本的邏輯完全一樣
-        output_df = result_df.head(TOP_N).reset_index(drop=True)
-        output_path = f"candidates_{TOP_N}.csv"
+        final_df = result_df.head(TOP_N).copy()
+        output_count = TOP_N
 
     # 標記名次 這個名次之後在介面上會用來標記每日分析結果的排名
-    output_df["rank"] = output_df.index + 1
+    final_df["rank"] = final_df.index + 1
 
-    output_df.to_csv(output_path, index=False)
-    print(f"=== 完成 已將 {len(output_df)} 支ETF存到 {output_path} ===")
+    # 檔名依照實際輸出的股票數量命名
+    output_path = f"candidates_{output_count}.csv"
+    final_df.to_csv(output_path, index=False)
+    print(f"=== 完成 已將 {output_count} 支ETF存到 {output_path} ===")
 
 
 if __name__ == "__main__":
