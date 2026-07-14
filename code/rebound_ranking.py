@@ -5,9 +5,9 @@
 # 找出讓best_rebound_ratio最大的專屬觸發門檻(trigger_zscore)和最佳持有天數(optimal_days)
 # 波動率篩選也在grid search這一步做 用的是過去10年的資料 不是ETF上市以來的全部資料
 # 這樣可以排除掉ETF剛上市那幾年通常比較不穩定 不確定性較高的時期
-# 最後把通過的ETF按照best_rebound_ratio排序
-# 如果通過低波動率定義並完成grid search的ETF不到100支 就把這些全部存起來 檔名依照實際數量命名
-# 如果超過100支 就照原本的邏輯只取前100名
+# 目前main()會把完成grid search的全部ETF直接存檔 檔名依照實際數量命名 例如candidates_194.csv
+# filter_top_n這個函式保留從N支篩選到前TOP_N支的邏輯 但main()目前沒有呼叫它
+# 這是刻意保留下來的 之後學到更多篩選知識後 可以在這194支的基礎上繼續往下篩選
 # 這個排名不會隨著最新股價變動 因為是根據過去10年全部歷史資料算出來的 不是這幾天的資料
 
 import pandas as pd
@@ -41,7 +41,7 @@ VOLATILITY_THRESHOLD = 0.6
 # 排除後用剩下的資料重新算一次mean和std 這組修正過的統計基準才會拿去用在grid search和每日分析
 EXTREME_Z_THRESHOLD = 4
 
-# 最終取排名前幾名的ETF 如果通過的ETF不到這個數字 就全部保留
+# 這是filter_top_n函式要篩到剩下幾支的數字 目前main()沒有呼叫filter_top_n 這個常數先保留著
 TOP_N = 100
 
 # ---------------- 低波動率定義 ----------------
@@ -230,6 +230,25 @@ def find_best_params_for_etf(symbol, listing_years):
     }
 
 
+def filter_top_n(result_df):
+    """
+    這是從N支股票篩選到前TOP_N支的邏輯 依照best_rebound_ratio由大到小排序後取前TOP_N名
+    目前main()沒有呼叫這個函式 直接輸出全部通過grid search的股票 不做這一層篩選
+    這段邏輯保留在這裡 是為了將來學到更多篩選知識後 可以在這批股票的基礎上繼續往下篩選
+    輸入的result_df必須已經是完成grid search後的結果 且尚未排序
+    回傳裁切過的DataFrame 並附上排名欄位
+    """
+    sorted_df = result_df.sort_values("best_rebound_ratio", ascending=False).reset_index(drop=True)
+
+    if len(sorted_df) < TOP_N:
+        final_df = sorted_df.copy()
+    else:
+        final_df = sorted_df.head(TOP_N).copy()
+
+    final_df["rank"] = final_df.index + 1
+    return final_df
+
+
 def main():
     universe = pd.read_csv(UNIVERSE_PATH)
     print(f"=== 讀入母體ETF 共 {len(universe)} 支 開始逐一檢查是否符合低波動率定義 ===")
@@ -266,28 +285,20 @@ def main():
     result_df = pd.DataFrame(results)
     print(f"grid search完成 共 {len(result_df)} 支ETF找到有效參數組合")
 
-    # 按照best_rebound_ratio由大到小排序 這個排名方式跟原本程式碼完全一樣
+    # 按照best_rebound_ratio由大到小排序 全部完成grid search的ETF都保留 不做前TOP_N的裁切
+    # filter_top_n函式還在上面 只是這裡先不呼叫它 保留給以後繼續篩選用
     result_df.sort_values("best_rebound_ratio", ascending=False, inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
-    total_found = len(result_df)
-
-    # 如果通過的股票數量不到TOP_N 就把全部通過的股票都存起來 不做裁切
-    # 如果超過TOP_N 就照原本的邏輯只取前TOP_N名
-    if total_found < TOP_N:
-        final_df = result_df.copy()
-        output_count = total_found
-    else:
-        final_df = result_df.head(TOP_N).copy()
-        output_count = TOP_N
-
     # 標記名次 這個名次之後在介面上會用來標記每日分析結果的排名
-    final_df["rank"] = final_df.index + 1
+    result_df["rank"] = result_df.index + 1
 
-    # 檔名依照實際輸出的股票數量命名
+    output_count = len(result_df)
+
+    # 檔名依照實際輸出的股票數量命名 目前應該會是candidates_194.csv這種格式
     output_path = f"candidates_{output_count}.csv"
-    final_df.to_csv(output_path, index=False)
-    print(f"=== 完成 已將 {output_count} 支ETF存到 {output_path} ===")
+    result_df.to_csv(output_path, index=False)
+    print(f"=== 完成 已將全部 {output_count} 支ETF存到 {output_path} ===")
 
 
 if __name__ == "__main__":

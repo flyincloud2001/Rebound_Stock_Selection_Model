@@ -2,7 +2,7 @@
 # 這是整個模型的Streamlit介面 全程手動觸發 沒有排程
 # 分成兩個部分
 # 第一部分是候選ETF總覽 顯示candidates檔案裡的ETF 按照ETF類別分類顯示
-# 第二部分是每日分析 按下按鈕後 對這些ETF抓最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前十名
+# 第二部分是每日分析 按下按鈕後 對這些ETF抓最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前二十名
 
 import streamlit as st
 import pandas as pd
@@ -17,8 +17,8 @@ from datetime import datetime
 # 資料存放資料夾 每次按下分析鍵抓到的最新資料會存在這裡
 DATA_DIR = r"C:\Users\flyin\OneDrive\桌面\新代碼\Rebound Stock Selection Model\data"
 
-# 每日分析要挑出前幾名
-TOP_N_DAILY = 10
+# 每日分析要挑出前幾名 從10改成20
+TOP_N_DAILY = 20
 
 st.set_page_config(page_title="ETF反彈選股模型", layout="wide")
 
@@ -28,7 +28,7 @@ def _find_candidates_file():
     """
     找出目前資料夾裡的candidates檔案
     因為rebound_ranking.py現在會依照通過低波動率定義並完成grid search的實際股票數量來命名檔案
-    例如candidates_100.csv或candidates_87.csv 檔名不再固定
+    例如candidates_194.csv 檔名不再固定
     這裡抓資料夾裡符合candidates_開頭的csv檔 如果有多個就取最新修改的那個
     """
     matches = glob.glob("candidates_*.csv")
@@ -161,10 +161,10 @@ def save_snapshot(result_df):
 # ---------------- 畫圖 ----------------
 def plot_top_etfs(top_df):
     """
-    畫出前十名ETF的今日z_score和它們專屬觸發區間上界(負的trigger_zscore)的對照長條圖
+    畫出前二十名ETF的今日z_score和它們專屬觸發區間上界(負的trigger_zscore)的對照長條圖
     上界是區間裡最接近0的那條邊 可以直接看出每支ETF今天實際落點跟這條邊差多少
     """
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(14, 5))
     x = np.arange(len(top_df))
 
     ax.bar(x - 0.2, top_df["z_today"], width=0.4, label="今天的z_score")
@@ -174,7 +174,7 @@ def plot_top_etfs(top_df):
     ax.set_xticklabels(top_df["symbol"], rotation=45)
     ax.set_ylabel("z_score")
     ax.legend()
-    ax.set_title("前十名ETF 今日z_score與專屬觸發區間上界對照")
+    ax.set_title("前二十名ETF 今日z_score與專屬觸發區間上界對照")
 
     return fig
 
@@ -219,7 +219,7 @@ def main():
     # ---- 分頁二 每日分析 ----
     with tab2:
         st.subheader("執行每日分析")
-        st.write("按下按鈕後 會對所有候選ETF抓取最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前十名")
+        st.write(f"按下按鈕後 會對所有候選ETF抓取最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前{TOP_N_DAILY}名")
         st.caption("提醒 距離最近不代表這支ETF在其他區間下不會有更好的表現 只代表今天的狀況最接近它歷史上表現最好的那個區間")
 
         if st.button("開始分析"):
@@ -260,7 +260,7 @@ def main():
                 use_container_width=True
             )
 
-            st.subheader("今日z_score與專屬觸發區間上界對照圖")
+            st.subheader(f"今日z_score與專屬觸發區間上界對照圖")
             fig = plot_top_etfs(top_df)
             st.pyplot(fig)
 
