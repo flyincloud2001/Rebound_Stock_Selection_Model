@@ -44,6 +44,25 @@ EXTREME_DAY_THRESHOLD = 0.03
 # 過去10年裡 極端日次數占總交易天數的比例不能超過這個上限 超過就代表這支ETF平常波動就很劇烈
 MAX_EXTREME_DAY_RATIO = 0.02
 
+# 短期急跌篩選 抓的是短時間內集中發生的跌幅 不是波動率本身
+# 舉例 從高點跌到低點花了1年半 跌20% 這種算慢慢跌 可以接受
+# 但如果10個交易日內就跌超過15% 這種算急跌 除非是大盤同期也重挫的系統性風險 不然就算違規
+
+# 短窗口天數 用來偵測是否短期內集中發生大幅下跌
+RAPID_DECLINE_WINDOW = 10
+
+# 短窗口內累積跌幅超過這個比例 算一次急跌事件
+RAPID_DECLINE_THRESHOLD = -0.15
+
+# 用來判斷是否為系統性風險的基準指數 大盤同期也重挫的話不算這支ETF的問題
+BENCHMARK_SYMBOL = "SPY"
+
+# 同期基準指數也跌超過這個比例 就視為系統性風險 不計入違規次數
+BENCHMARK_CRISIS_THRESHOLD = -0.08
+
+# 非系統性的急跌事件次數不能超過這個上限 超過就代表這支ETF常常自己單獨重挫 不是低波動標的
+MAX_IDIOSYNCRATIC_CRASH_COUNT = 2
+
 # 極端值過濾門檻 初步z_score絕對值超過這個數字的日期會被排除 不參與統計基準的計算
 # 舉例 某天因為除息或財報跳空 return算出來的初步z_score是5.2 這種日子會被排除
 # 排除後用剩下的資料重新算一次mean和std 這組修正過的統計基準才會拿去用在grid search和每日分析
@@ -75,11 +94,12 @@ def _get_etf_category(ticker):
         return "未分類"
 
 
-def find_best_params_for_etf(symbol, listing_years):
+def find_best_params_for_etf(symbol, listing_years, spy_close):
     """
-    對單一ETF做完整的分析 包含波動率篩選 極端值過濾 和grid search
+    對單一ETF做完整的分析 包含波動率篩選 短期急跌篩選 極端值過濾 和grid search
+    spy_close是SPY過去10年的收盤價序列 用來判斷急跌是否為系統性風險
     回傳這支ETF的類別 專屬觸發門檻 最佳持有天數 best_rebound_ratio等欄位
-    如果波動率超標 資料不足 或找不到符合條件的組合 回傳None
+    如果波動率超標 短期內有太多非系統性急跌 資料不足 或找不到符合條件的組合 回傳None
     """
     ticker = yf.Ticker(symbol)
 
@@ -98,6 +118,31 @@ def find_best_params_for_etf(symbol, listing_years):
     extreme_day_ratio = (intraday_return.abs() > EXTREME_DAY_THRESHOLD).mean()
 
     if np.isnan(extreme_day_ratio) or extreme_day_ratio > MAX_EXTREME_DAY_RATIO:
+        return None
+
+    # ---- 短期急跌篩選 抓短時間內集中發生的跌幅 排除掉跟大盤同期重挫的系統性事件 ----
+    # 舉例 某段10個交易日跌了18% 先看SPY同一段時間跌了多少 如果SPY也跌超過8% 算系統性風險不計入違規
+    rolling_return = hist["Close"] / hist["Close"].shift(RAPID_DECLINE_WINDOW) - 1
+    crash_dates = rolling_return[rolling_return < RAPID_DECLINE_THRESHOLD].index
+
+    idiosyncratic_crash_count = 0
+
+    for d in crash_dates:
+        if d not in spy_close.index:
+            continue
+
+        spy_window = spy_close.loc[:d].iloc[-RAPID_DECLINE_WINDOW:]
+
+        if len(spy_window) < RAPID_DECLINE_WINDOW:
+            continue
+
+        spy_window_return = spy_window.iloc[-1] / spy_window.iloc[0] - 1
+
+        if spy_window_return >= BENCHMARK_CRISIS_THRESHOLD:
+            # SPY同期沒有明顯重挫 代表這是這支ETF自己單獨發生的急跌 不是系統性風險
+            idiosyncratic_crash_count += 1
+
+    if idiosyncratic_crash_count > MAX_IDIOSYNCRATIC_CRASH_COUNT:
         return None
 
     # 年化波動率不再當作篩選依據 但還是算出來存進輸出檔案 給介面顯示用 方便對照參考
@@ -188,11 +233,13 @@ def find_best_params_for_etf(symbol, listing_years):
         "annualized_volatility": round(float(annualized_volatility), 4),
         # 單日收盤對開盤變動超過3%的日子占總交易天數的比例 這是現在實際拿來篩選低波動率的依據
         "extreme_day_ratio": round(float(extreme_day_ratio), 4),
+        # 非系統性急跌事件次數 這是短期急跌篩選的依據 數字越高代表這支ETF越常自己單獨重挫
+        "idiosyncratic_crash_count": int(idiosyncratic_crash_count),
         # 這支ETF專屬的觸發門檻和最佳持有天數 是grid search在過去10年資料裡找出的最佳區間組合
         # 注意這裡用float而不是int 因為grid裡有1.5 2.5 3.5這種非整數值 用int會被錯誤截斷成1或2
         "trigger_zscore": float(trigger_zscore),
         "optimal_days": int(optimal_days),
-        "best_rebound_ratio": round(float(best_ratio), 4),
+        "best_rebound_ratio": round(float(best_ratio), 2),
         "event_count": int(event_count),
         "total_trading_days": int(total_trading_days),
         # 這兩個欄位是過濾掉極端值之後 這支ETF過去10年return的平均值和標準差
@@ -206,13 +253,17 @@ def main():
     universe = pd.read_csv(UNIVERSE_PATH)
     print(f"=== 讀入母體ETF 共 {len(universe)} 支 開始逐一做波動率篩選 極端值過濾與grid search ===")
 
+    # 先抓一次SPY過去10年的資料 當作判斷急跌是否為系統性風險的共用基準 不用每支ETF都重抓一次
+    print("先抓取SPY作為系統性風險判斷基準...")
+    spy_close = yf.Ticker(BENCHMARK_SYMBOL).history(period=f"{LOOKBACK_YEARS}y", auto_adjust=True)["Close"]
+
     results = []
 
     for i, row in universe.iterrows():
         if i % PROGRESS_INTERVAL == 0:
             print(f"處理進度 {i}/{len(universe)}")
 
-        params = find_best_params_for_etf(row["symbol"], row["listing_years"])
+        params = find_best_params_for_etf(row["symbol"], row["listing_years"], spy_close)
 
         if params is not None:
             results.append(params)

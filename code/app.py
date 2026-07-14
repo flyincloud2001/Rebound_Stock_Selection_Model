@@ -108,11 +108,11 @@ def fetch_today_status(row):
         "optimal_days": row["optimal_days"],
         "best_rebound_ratio": row["best_rebound_ratio"],
         "today_date": today_date,
-        "today_return": round(float(today_return), 4),
+        "today_return": round(float(today_return), 2),
         "z_today": round(float(z_today), 2),
         "distance": round(float(distance), 3),
         # 此刻(抓資料當下)的即時報酬率和z_score 跟today_return z_today是不同時間點的兩組數字
-        "current_return": round(float(current_return), 4) if not np.isnan(current_return) else None,
+        "current_return": round(float(current_return), 2) if not np.isnan(current_return) else None,
         "z_now": round(float(z_now), 2) if not np.isnan(z_now) else None
     }
 
@@ -203,7 +203,7 @@ def main():
                     category_df[[
                         "rank", "symbol", "trigger_zscore", "optimal_days",
                         "best_rebound_ratio", "event_count", "listing_years",
-                        "extreme_day_ratio", "annualized_volatility"
+                        "extreme_day_ratio", "idiosyncratic_crash_count", "annualized_volatility"
                     ]].rename(columns={
                         "rank": "排名",
                         "symbol": "代碼",
@@ -213,6 +213,7 @@ def main():
                         "event_count": "歷史事件次數",
                         "listing_years": "上市年限",
                         "extreme_day_ratio": "單日極端變動比例(篩選依據)",
+                        "idiosyncratic_crash_count": "非系統性急跌次數(篩選依據)",
                         "annualized_volatility": "年化波動率(僅供參考)"
                     }),
                     use_container_width=True
