@@ -18,16 +18,12 @@ BIN_WIDTH = 0.5
 
 MIN_EVENTS = 8   # 一個區間篩出的事件數少於這個數字就不採用 避免過度配適
 
-# 低波動率篩選 不用年化標準差 因為抓不到DIG這種槓桿ETF的問題 改用單日極端變動比例
-EXTREME_DAY_THRESHOLD = 0.03    # 單日收盤對開盤變動超過3%算一次極端日
-MAX_EXTREME_DAY_RATIO = 0.02    # 極端日比例不能超過2%
-
-# 短期急跌篩選 抓短時間內集中發生的跌幅 排除跟大盤同期重挫的系統性事件
-RAPID_DECLINE_WINDOW = 10           # 短窗口天數
-RAPID_DECLINE_THRESHOLD = -0.15     # 窗口內跌幅超過15%算一次急跌事件
-BENCHMARK_SYMBOL = "SPY"            # 系統性風險判斷基準
-BENCHMARK_CRISIS_THRESHOLD = -0.08  # 基準同期也跌超過這個比例 視為系統性風險 不計入違規
-MAX_IDIOSYNCRATIC_CRASH_COUNT = 2   # 非系統性急跌次數上限
+# 低波動率篩選 用S&P 500 Low Volatility Index官方方法論的定義
+# 波動率是過去252個交易日(近1年)每日報酬率標準差 再年化
+# 25%這個門檻是實測校準出來的 VOO 12.5% SPY 12.6% ZEB.TO 13.3% QQQ 18.6%都在門檻內
+# DIG這種2倍槓桿ETF算出來是42% EWV CURE等槓桿ETF都在30%以上 會被乾淨排除
+VOLATILITY_WINDOW = 252
+VOLATILITY_THRESHOLD = 0.25
 
 EXTREME_Z_THRESHOLD = 4   # 初步z_score絕對值超過這個數字的日期排除 不參與統計基準計算
 
@@ -46,30 +42,9 @@ def _get_etf_category(ticker):
         return "未分類"
 
 
-def _count_idiosyncratic_crashes(close, spy_close):
+def find_best_params_for_etf(symbol, listing_years):
     """
-    計算短期急跌次數中 有幾次不是跟大盤同期重挫的系統性事件
-    舉例 某段10天跌了18% 同期SPY只跌了3% 這就算一次非系統性急跌
-    """
-    rolling_return = close / close.shift(RAPID_DECLINE_WINDOW) - 1
-    crash_dates = rolling_return[rolling_return < RAPID_DECLINE_THRESHOLD].index
-
-    count = 0
-    for d in crash_dates:
-        if d not in spy_close.index:
-            continue
-        spy_window = spy_close.loc[:d].iloc[-RAPID_DECLINE_WINDOW:]
-        if len(spy_window) < RAPID_DECLINE_WINDOW:
-            continue
-        spy_window_return = spy_window.iloc[-1] / spy_window.iloc[0] - 1
-        if spy_window_return >= BENCHMARK_CRISIS_THRESHOLD:
-            count += 1
-    return count
-
-
-def find_best_params_for_etf(symbol, listing_years, spy_close):
-    """
-    對單一ETF做波動率篩選 短期急跌篩選 極端值過濾 和grid search
+    對單一ETF做波動率篩選 極端值過濾 和grid search
     回傳專屬trigger_zscore optimal_days best_rebound_ratio等欄位 不符合任一篩選條件回傳None
     """
     ticker = yf.Ticker(symbol)
@@ -82,19 +57,11 @@ def find_best_params_for_etf(symbol, listing_years, spy_close):
     if hist.empty or len(hist) < 500:
         return None
 
-    # 單日收盤對開盤變動比例篩選
-    intraday_return = hist["Close"] / hist["Open"] - 1
-    extreme_day_ratio = (intraday_return.abs() > EXTREME_DAY_THRESHOLD).mean()
-    if np.isnan(extreme_day_ratio) or extreme_day_ratio > MAX_EXTREME_DAY_RATIO:
+    # 波動率篩選 用S&P官方定義 近1年每日報酬率標準差 年化後跟VOLATILITY_THRESHOLD比較
+    close_return = hist["Close"].pct_change().dropna()
+    annualized_volatility = close_return.tail(VOLATILITY_WINDOW).std() * np.sqrt(252)
+    if np.isnan(annualized_volatility) or annualized_volatility > VOLATILITY_THRESHOLD:
         return None
-
-    # 短期急跌篩選 排除掉太常自己單獨重挫的ETF
-    idiosyncratic_crash_count = _count_idiosyncratic_crashes(hist["Close"], spy_close)
-    if idiosyncratic_crash_count > MAX_IDIOSYNCRATIC_CRASH_COUNT:
-        return None
-
-    # 年化波動率不當篩選依據 只算出來給介面參考
-    annualized_volatility = hist["Close"].pct_change().dropna().std() * np.sqrt(252)
 
     # 準備grid search資料 return是開盤對前一日收盤的報酬率 是偵測下跌事件的訊號
     data = hist[["Close", "High", "Open"]].copy()
@@ -152,8 +119,6 @@ def find_best_params_for_etf(symbol, listing_years, spy_close):
         "category": _get_etf_category(ticker),
         "listing_years": listing_years,
         "annualized_volatility": round(float(annualized_volatility), 4),
-        "extreme_day_ratio": round(float(extreme_day_ratio), 4),
-        "idiosyncratic_crash_count": int(idiosyncratic_crash_count),
         "trigger_zscore": float(trigger_zscore),   # float因為grid裡有1.5 2.5 3.5 用int會被截斷
         "optimal_days": int(optimal_days),
         "best_rebound_ratio": round(float(best_ratio), 3),
@@ -168,14 +133,11 @@ def main():
     universe = pd.read_csv(UNIVERSE_PATH)
     print(f"=== 讀入母體ETF 共 {len(universe)} 支 開始篩選與grid search ===")
 
-    # 先抓一次SPY資料 當作判斷系統性風險的共用基準 不用每支ETF都重抓
-    spy_close = yf.Ticker(BENCHMARK_SYMBOL).history(period=f"{LOOKBACK_YEARS}y", auto_adjust=True)["Close"]
-
     results = []
     for i, row in universe.iterrows():
         if i % PROGRESS_INTERVAL == 0:
             print(f"處理進度 {i}/{len(universe)}")
-        params = find_best_params_for_etf(row["symbol"], row["listing_years"], spy_close)
+        params = find_best_params_for_etf(row["symbol"], row["listing_years"])
         if params is not None:
             results.append(params)
         time.sleep(REQUEST_DELAY)

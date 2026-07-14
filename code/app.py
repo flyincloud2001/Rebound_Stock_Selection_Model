@@ -149,15 +149,12 @@ def main():
                 st.dataframe(
                     category_df[[
                         "rank", "symbol", "trigger_zscore", "optimal_days", "best_rebound_ratio",
-                        "event_count", "listing_years", "extreme_day_ratio",
-                        "idiosyncratic_crash_count", "annualized_volatility"
+                        "event_count", "listing_years", "annualized_volatility"
                     ]].rename(columns={
                         "rank": "排名", "symbol": "代碼", "trigger_zscore": "觸發門檻震幅(Z值)",
                         "optimal_days": "最佳持有天數", "best_rebound_ratio": "最佳反彈報酬率",
                         "event_count": "歷史事件次數", "listing_years": "上市年限",
-                        "extreme_day_ratio": "單日極端變動比例(篩選依據)",
-                        "idiosyncratic_crash_count": "非系統性急跌次數(篩選依據)",
-                        "annualized_volatility": "年化波動率(僅供參考)"
+                        "annualized_volatility": "近1年年化波動率(篩選依據)"
                     }),
                     use_container_width=True
                 )
