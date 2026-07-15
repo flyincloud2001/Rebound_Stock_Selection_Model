@@ -15,6 +15,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import os
 import glob
+import time
 from datetime import datetime
 
 # ---------------- 參數設定 ----------------
@@ -23,6 +24,15 @@ DATA_DIR = r"C:\Users\flyin\OneDrive\桌面\新代碼\Rebound Stock Selection Mo
 
 # 每日分析要挑出前幾名
 TOP_N_DAILY = 20
+
+# 每次抓完一支ETF之後等待的秒數 降低短時間內大量請求被Yahoo限流的機率
+REQUEST_DELAY = 0.2
+
+# 單一支ETF抓取失敗時最多重試幾次 每次重試中間會多等一段時間
+MAX_RETRIES = 3
+
+# 重試之間的等待秒數 每重試一次會用這個秒數乘上重試次數 越重試等越久
+RETRY_BACKOFF_SECONDS = 1.5
 
 st.set_page_config(page_title="ETF反彈選股模型", layout="wide")
 
@@ -144,43 +154,65 @@ def fetch_yesterday_status(row):
     對一支ETF抓最近幾天的資料 算出昨天收盤對昨天開盤的漲跌幅和z_score
     這個z_score昨天收盤後就已經確定 用來決定今天要不要盤前掛單買進
     再算出昨天的z_score跟這支ETF專屬觸發區間的距離
-    回傳一個dict 如果抓取失敗回傳None
+    回傳(dict, None)代表成功 或(None, 錯誤原因字串)代表失敗
     """
     symbol = row["symbol"]
 
-    try:
-        hist = yf.Ticker(symbol).history(period="10d", auto_adjust=True)
-    except Exception:
-        return None
+    # 抓資料失敗時重試最多MAX_RETRIES次 每次重試中間多等一點時間 降低暫時性限流或網路問題造成的抓取失敗
+    # last_error留著實際的錯誤訊息 全部重試都失敗時要回報給使用者看 不能只顯示"抓取失敗"這種看不出原因的字
+    hist = None
+    last_error = "未知錯誤"
+    for attempt in range(MAX_RETRIES):
+        try:
+            hist = yf.Ticker(symbol).history(period="10d", auto_adjust=True)
+            if not hist.empty:
+                break
+            last_error = "回傳的資料是空的"
+        except Exception as e:
+            hist = None
+            last_error = f"{type(e).__name__}: {e}"
 
-    if len(hist) < 2:
-        return None
+        if attempt < MAX_RETRIES - 1:
+            time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+
+    if hist is None or hist.empty:
+        return None, last_error
+
+    # 有時候Yahoo在美股開盤前這個時間點 最新一天的資料還沒處理完成 Open和Close會是NaN
+    # 先把這種缺值的列濾掉 剩下的才是真正可以用的完整交易日資料
+    # 這樣即使最新一天暫時抓不到 也能自動退回去用前一個真正有完整資料的交易日 不會整支股票直接判定失敗
+    valid_hist = hist.dropna(subset=["Open", "Close"])
+
+    if len(valid_hist) < 1:
+        return None, "近期資料都是缺值 可能是Yahoo資料還沒更新完成 晚點再試看看"
 
     # hist.index是用美東時間(America/New_York)標記的 不能拿datetime.now()這種本地系統時間去比對
     # 因為Foster的電腦在台灣 datetime.now()回傳的是台灣時間 台灣比美東快12到13小時
     # 如果直接比較 會把還沒收盤的美股session誤判成已經收盤 或反過來 判斷完全錯亂
-    # 正確做法是用hist.index[-1]自己帶的時區資訊 換算出"現在"在美東時間是幾點幾號
-    now_in_market_tz = pd.Timestamp.now(tz=hist.index[-1].tz)
-    last_row_date = hist.index[-1].date()
+    # 正確做法是用valid_hist.index[-1]自己帶的時區資訊 換算出"現在"在美東時間是幾點幾號
+    now_in_market_tz = pd.Timestamp.now(tz=valid_hist.index[-1].tz)
+    last_valid_date = valid_hist.index[-1].date()
     today_date_in_market_tz = now_in_market_tz.date()
 
     # 只比較日期還不夠 因為即使美東日期還是同一天 如果已經過了美東下午4點收盤時間
     # 這一天的資料其實已經是完整的一天了 不該再當作"還在進行中的今天"
-    # 舉例 台灣早上8點查詢 換算成美東是前一天晚上8點 已經收盤4小時 這時候hist最後一列就該當完整的一天處理
+    # 舉例 台灣早上8點查詢 換算成美東是前一天晚上8點 已經收盤4小時 這時候最後一列就該當完整的一天處理
     market_close_time = now_in_market_tz.replace(hour=16, minute=0, second=0, microsecond=0)
-    last_row_still_in_progress = (last_row_date == today_date_in_market_tz) and (now_in_market_tz < market_close_time)
+    last_row_still_in_progress = (last_valid_date == today_date_in_market_tz) and (now_in_market_tz < market_close_time)
 
     if last_row_still_in_progress:
-        yesterday_open = hist["Open"].iloc[-2]
-        yesterday_close = hist["Close"].iloc[-2]
-        yesterday_date = hist.index[-2].strftime("%Y-%m-%d")
+        if len(valid_hist) < 2:
+            return None, "只有今天這一筆有效資料 還沒有完整的昨天資料"
+        yesterday_row = valid_hist.iloc[-2]
     else:
-        yesterday_open = hist["Open"].iloc[-1]
-        yesterday_close = hist["Close"].iloc[-1]
-        yesterday_date = hist.index[-1].strftime("%Y-%m-%d")
+        yesterday_row = valid_hist.iloc[-1]
+
+    yesterday_open = yesterday_row["Open"]
+    yesterday_close = yesterday_row["Close"]
+    yesterday_date = yesterday_row.name.strftime("%Y-%m-%d")
 
     if yesterday_open == 0 or pd.isna(yesterday_open) or pd.isna(yesterday_close):
-        return None
+        return None, "昨天的開盤價或收盤價是0或缺值"
 
     yesterday_return = yesterday_close / yesterday_open
 
@@ -216,7 +248,7 @@ def fetch_yesterday_status(row):
         "yesterday_return": round(float(yesterday_return), 4),
         "z_yesterday": round(float(z_yesterday), 2),
         "distance": round(float(distance), 3)
-    }
+    }, None
 
 
 # ---------------- 執行每日分析 ----------------
@@ -231,12 +263,15 @@ def run_daily_analysis(candidates_df, log_placeholder, progress_bar):
     logs = []
 
     for i, row in candidates_df.iterrows():
-        result = fetch_yesterday_status(row)
+        result, error_reason = fetch_yesterday_status(row)
 
         if result is not None:
             records.append(result)
         else:
-            logs.append(f"{row['symbol']} 資料抓取失敗 已略過")
+            logs.append(f"{row['symbol']} 資料抓取失敗 已略過 原因 {error_reason}")
+
+        # 每支ETF之間留一點間隔 降低短時間內大量請求被Yahoo限流的機率
+        time.sleep(REQUEST_DELAY)
 
         if i % 10 == 0 or i == total - 1:
             progress_bar.progress(min((i + 1) / total, 1.0))
