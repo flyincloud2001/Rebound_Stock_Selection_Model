@@ -27,6 +27,77 @@ TOP_N_DAILY = 20
 st.set_page_config(page_title="ETF反彈選股模型", layout="wide")
 
 
+# ---------------- 手動分類對照表 ----------------
+# category只是拿來給介面分組顯示用的 不影響trigger_zscore grid search這些核心運算
+# 加拿大上市的ETF在yfinance裡常常查不到category 導致rebound_ranking.py存進candidates檔案時標記成"未分類"
+# 這個對照表是針對這些查不到category的ETF 依照它們的longName和實際持有內容手動查證分類出來的
+# 放在app.py這裡 讀取candidates檔案時直接套用 不需要重新跑一次rebound_ranking.py(重跑要花很久去抓194支股票的10年歷史資料)
+# 如果之後universe.csv換了一批新的加拿大ETF 出現不在這個表裡的代碼 還是會顯示"未分類"
+# 到時候要再手動查證新增進來
+MANUAL_CATEGORY_OVERRIDES = {
+    # 債券ETF
+    "XCB.TO": "債券(加拿大投資等級公司債)",
+    "XLB.TO": "債券(加拿大長天期債券)",
+    "XRB.TO": "債券(加拿大實質報酬債券)",
+    "ZFL.TO": "債券(加拿大聯邦長天期債券)",
+    "CBO.TO": "債券(加拿大公司債梯型1至5年)",
+    "XIG.TO": "債券(美國投資等級公司債避險)",
+    "HAB.TO": "債券(主動管理公司債)",
+    "ZRR.TO": "債券(實質報酬債券)",
+    "XSB.TO": "債券(加拿大短天期債券)",
+    "ZCM.TO": "債券(中天期公司債)",
+    "ZCS.TO": "債券(短天期公司債)",
+    "CLF.TO": "債券(加拿大政府債梯型1至5年)",
+    "XQB.TO": "債券(高評級加拿大債券)",
+    "ZPS.TO": "債券(短天期省政府債)",
+    "XBB.TO": "債券(加拿大全市場債券)",
+    "ZAG.TO": "債券(加拿大綜合債券)",
+    # 不動產REIT
+    "RIT.TO": "不動產REIT(加拿大)",
+    "CGR.TO": "不動產REIT(全球)",
+    "ZRE.TO": "不動產REIT(加拿大等權重)",
+    "XRE.TO": "不動產REIT(加拿大市值加權)",
+    # 加拿大金融股區塊
+    "CEW.TO": "加拿大金融股(銀行保險等權重)",
+    "ZWB.TO": "加拿大金融股(銀行備兌買權)",
+    "ZEB.TO": "加拿大金融股(銀行等權重)",
+    # 商品原物料
+    "HUC.TO": "商品原物料(原油)",
+    "XGD.TO": "商品原物料(全球黃金股)",
+    "ZMT.TO": "商品原物料(全球基本金屬避險)",
+    "XEG.TO": "商品原物料(加拿大能源類股)",
+    "HUN.TO": "商品原物料(天然氣)",
+    "GLCC.TO": "商品原物料(黃金生產商備兌買權)",
+    # 單一國家或區域股票
+    "XCH.TO": "單一國家或區域股票(中國)",
+    "ZCH.TO": "單一國家或區域股票(中國)",
+    "XEM.TO": "單一國家或區域股票(新興市場)",
+    "ZEM.TO": "單一國家或區域股票(新興市場)",
+    "ZDM.TO": "單一國家或區域股票(已開發市場避險)",
+    # 美股廣泛指數 但在加拿大掛牌查不到category
+    "XSP.TO": "美股廣泛指數(S&P500避險)",
+    "ZQQ.TO": "美股廣泛指數(Nasdaq100避險)",
+    "HXS.TO": "美股廣泛指數(S&P500公司股份結構)",
+    "XSU.TO": "美股廣泛指數(美國小型股避險)",
+    # 加拿大廣泛股票指數
+    "XIU.TO": "加拿大廣泛股票指數(TSX60)",
+    "ZCN.TO": "加拿大廣泛股票指數(TSX綜合指數)",
+    "XCS.TO": "加拿大廣泛股票指數(TSX小型股)",
+    "XCV.TO": "加拿大廣泛股票指數(價值型)",
+    "XCG.TO": "加拿大廣泛股票指數(成長型)",
+    "XDV.TO": "加拿大廣泛股票指數(精選股息)",
+    "CDZ.TO": "加拿大廣泛股票指數(股息貴族)",
+    # 全球或多元資產配置
+    "XWD.TO": "全球或多元資產配置(MSCI世界指數)",
+    "XBAL.TO": "全球或多元資產配置(核心平衡型)",
+    "CGAA.TO": "全球或多元資產配置(全球資產配置私募池)",
+    # 優先股
+    "HPR.TO": "優先股(主動管理)",
+    # 基礎建設
+    "CIF.TO": "基礎建設(全球)"
+}
+
+
 # ---------------- 找出candidates檔案 ----------------
 def _find_candidates_file():
     """
@@ -54,6 +125,16 @@ def load_candidates():
     """
     path = _find_candidates_file()
     df = pd.read_csv(path)
+
+    # 把category是"未分類"的股票 拿symbol去MANUAL_CATEGORY_OVERRIDES查有沒有對應的手動分類
+    # 查得到就覆蓋掉 查不到就維持"未分類" 這一步不會動到CSV檔案本身 只影響畫面上顯示的結果
+    def _apply_override(row):
+        if row["category"] == "未分類" and row["symbol"] in MANUAL_CATEGORY_OVERRIDES:
+            return MANUAL_CATEGORY_OVERRIDES[row["symbol"]]
+        return row["category"]
+
+    df["category"] = df.apply(_apply_override, axis=1)
+
     return df, path
 
 
