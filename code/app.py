@@ -2,7 +2,11 @@
 # 這是整個模型的Streamlit介面 全程手動觸發 沒有排程
 # 分成兩個部分
 # 第一部分是候選ETF總覽 顯示candidates檔案裡的ETF 按照ETF類別分類顯示
-# 第二部分是每日分析 按下按鈕後 對這些ETF抓最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前二十名
+# 第二部分是每日分析 按下按鈕後 對這些ETF抓最新資料 找出昨日z_score落在自己專屬觸發區間內或最接近的前二十名
+#
+# 這一版的交易邏輯是盤前交易 用昨天收盤對昨天開盤的當日內漲跌當作訊號
+# 這個訊號昨天收盤後就已經確定 可以在今天開盤前用這個訊號盤前掛單 用今天的開盤價買進
+# 賺的是進場後這幾天內反彈的價差
 
 import streamlit as st
 import pandas as pd
@@ -17,7 +21,7 @@ from datetime import datetime
 # 資料存放資料夾 每次按下分析鍵抓到的最新資料會存在這裡
 DATA_DIR = r"C:\Users\flyin\OneDrive\桌面\新代碼\Rebound Stock Selection Model\data"
 
-# 每日分析要挑出前幾名 從10改成20
+# 每日分析要挑出前幾名
 TOP_N_DAILY = 20
 
 st.set_page_config(page_title="ETF反彈選股模型", layout="wide")
@@ -45,19 +49,20 @@ def _find_candidates_file():
 def load_candidates():
     """
     讀取grid search算好的candidates檔案
-    這個檔案裡每一列是一支ETF 包含它專屬的trigger_zscore(觸發區間下界) optimal_days(最佳持有天數)等參數
-    return_mean和return_std都是已經過濾掉極端值之後算出來的統計基準
+    這個檔案裡每一列是一支ETF 包含它專屬的trigger_zscore(觸發區間上界 已經是負值)和optimal_days(最佳持有天數)等參數
+    return_mean和return_std都是已經過濾掉極端值之後算出來的統計基準 用的是當天收盤對當天開盤的報酬率
     """
     path = _find_candidates_file()
     df = pd.read_csv(path)
     return df, path
 
 
-# ---------------- 對單一ETF抓最新資料並計算今天的z_score ----------------
-def fetch_today_status(row):
+# ---------------- 對單一ETF抓最新資料並計算昨天的z_score ----------------
+def fetch_yesterday_status(row):
     """
-    對一支ETF抓最近幾天的資料 算出今天的return和z_score
-    再算出今天z_score跟這支ETF專屬觸發區間的距離
+    對一支ETF抓最近幾天的資料 算出昨天收盤對昨天開盤的漲跌幅和z_score
+    這個z_score昨天收盤後就已經確定 用來決定今天要不要盤前掛單買進
+    再算出昨天的z_score跟這支ETF專屬觸發區間的距離
     回傳一個dict 如果抓取失敗回傳None
     """
     symbol = row["symbol"]
@@ -70,35 +75,52 @@ def fetch_today_status(row):
     if len(hist) < 2:
         return None
 
-    # 用最新一筆資料當作今天 前一筆資料的收盤價當作昨收
-    # 舉例 hist最後一列的Open是150元 倒數第二列的Close是148元 today_return就是150/148約等於1.0135
-    prev_close = hist["Close"].iloc[-2]
-    today_open = hist["Open"].iloc[-1]
-    today_date = hist.index[-1].strftime("%Y-%m-%d")
+    # hist.index是用美東時間(America/New_York)標記的 不能拿datetime.now()這種本地系統時間去比對
+    # 因為Foster的電腦在台灣 datetime.now()回傳的是台灣時間 台灣比美東快12到13小時
+    # 如果直接比較 會把還沒收盤的美股session誤判成已經收盤 或反過來 判斷完全錯亂
+    # 正確做法是用hist.index[-1]自己帶的時區資訊 換算出"現在"在美東時間是幾點幾號
+    now_in_market_tz = pd.Timestamp.now(tz=hist.index[-1].tz)
+    last_row_date = hist.index[-1].date()
+    today_date_in_market_tz = now_in_market_tz.date()
 
-    if prev_close == 0 or pd.isna(prev_close) or pd.isna(today_open):
+    # 只比較日期還不夠 因為即使美東日期還是同一天 如果已經過了美東下午4點收盤時間
+    # 這一天的資料其實已經是完整的一天了 不該再當作"還在進行中的今天"
+    # 舉例 台灣早上8點查詢 換算成美東是前一天晚上8點 已經收盤4小時 這時候hist最後一列就該當完整的一天處理
+    market_close_time = now_in_market_tz.replace(hour=16, minute=0, second=0, microsecond=0)
+    last_row_still_in_progress = (last_row_date == today_date_in_market_tz) and (now_in_market_tz < market_close_time)
+
+    if last_row_still_in_progress:
+        yesterday_open = hist["Open"].iloc[-2]
+        yesterday_close = hist["Close"].iloc[-2]
+        yesterday_date = hist.index[-2].strftime("%Y-%m-%d")
+    else:
+        yesterday_open = hist["Open"].iloc[-1]
+        yesterday_close = hist["Close"].iloc[-1]
+        yesterday_date = hist.index[-1].strftime("%Y-%m-%d")
+
+    if yesterday_open == 0 or pd.isna(yesterday_open) or pd.isna(yesterday_close):
         return None
 
-    today_return = today_open / prev_close
+    yesterday_return = yesterday_close / yesterday_open
 
-    # 用grid search時存下的return_mean和return_std 算出今天的z_score
+    # 用grid search時存下的return_mean和return_std 算出昨天的z_score
     # 這組統計基準已經在rebound_ranking.py裡過濾過極端值 這裡要用同一套才會跟排名時的定義一致
-    z_today = (today_return - row["return_mean"]) / row["return_std"]
+    z_yesterday = (yesterday_return - row["return_mean"]) / row["return_std"]
 
-    # 這支ETF專屬的觸發區間 下界是負的(trigger_zscore加1)不含 上界是負的trigger_zscore含
-    # 舉例 trigger_zscore是2 區間就是負的3(不含)到負的2(含)
+    # trigger_zscore現在本身就是負值 直接當作區間上界使用 不用再加負號
+    # 舉例 trigger_zscore是負2 區間就是負3(不含)到負2(含)
     trigger_zscore = row["trigger_zscore"]
-    lower_bound = -(trigger_zscore + 1)
-    upper_bound = -trigger_zscore
+    upper_bound = trigger_zscore
+    lower_bound = trigger_zscore - 1
 
-    # distance是今天z_score跟這個區間的距離 如果今天z_score本來就落在區間內 distance算0
-    # 舉例 區間是負的3到負的2 今天z_today是負的2.4 屬於落在區間內 distance就是0
-    # 舉例 今天z_today是負的1.5 比區間上界負的2還高(跌得不夠深) distance就是1.5加負2的差 也就是0.5
-    # 距離小不代表今天一定會反彈 只代表今天的狀況比較接近這支ETF歷史上表現最好的那個區間
-    if z_today > upper_bound:
-        distance = z_today - upper_bound
-    elif z_today <= lower_bound:
-        distance = lower_bound - z_today
+    # distance是昨天z_score跟這個區間的距離 如果昨天z_score本來就落在區間內 distance算0
+    # 舉例 區間是負3到負2 昨天z_yesterday是負2.4 屬於落在區間內 distance就是0
+    # 舉例 昨天z_yesterday是負1.5 比區間上界負2還高(跌得不夠深) distance就是1.5減2的差 也就是0.5
+    # 距離小不代表買進後一定會反彈 只代表昨天的狀況比較接近這支ETF歷史上表現最好的那個區間
+    if z_yesterday > upper_bound:
+        distance = z_yesterday - upper_bound
+    elif z_yesterday <= lower_bound:
+        distance = lower_bound - z_yesterday
     else:
         distance = 0.0
 
@@ -109,9 +131,9 @@ def fetch_today_status(row):
         "trigger_zscore": row["trigger_zscore"],
         "optimal_days": row["optimal_days"],
         "best_rebound_ratio": row["best_rebound_ratio"],
-        "today_date": today_date,
-        "today_return": round(float(today_return), 4),
-        "z_today": round(float(z_today), 2),
+        "yesterday_date": yesterday_date,
+        "yesterday_return": round(float(yesterday_return), 4),
+        "z_yesterday": round(float(z_yesterday), 2),
         "distance": round(float(distance), 3)
     }
 
@@ -119,16 +141,16 @@ def fetch_today_status(row):
 # ---------------- 執行每日分析 ----------------
 def run_daily_analysis(candidates_df, log_placeholder, progress_bar):
     """
-    對candidates_df裡的每支ETF呼叫fetch_today_status
+    對candidates_df裡的每支ETF呼叫fetch_yesterday_status
     過程中會更新畫面上的進度條和文字紀錄
-    回傳一個完整的DataFrame 包含所有候選ETF的今日狀態
+    回傳一個完整的DataFrame 包含所有候選ETF昨天的狀態
     """
     records = []
     total = len(candidates_df)
     logs = []
 
     for i, row in candidates_df.iterrows():
-        result = fetch_today_status(row)
+        result = fetch_yesterday_status(row)
 
         if result is not None:
             records.append(result)
@@ -161,20 +183,21 @@ def save_snapshot(result_df):
 # ---------------- 畫圖 ----------------
 def plot_top_etfs(top_df):
     """
-    畫出前二十名ETF的今日z_score和它們專屬觸發區間上界(負的trigger_zscore)的對照長條圖
-    上界是區間裡最接近0的那條邊 可以直接看出每支ETF今天實際落點跟這條邊差多少
+    畫出前N名ETF昨天的z_score和它們專屬觸發區間上界的對照長條圖
+    trigger_zscore本身已經是負值 直接拿來畫 不用再加負號
+    上界是區間裡最接近0的那條邊 可以直接看出每支ETF昨天實際落點跟這條邊差多少
     """
     fig, ax = plt.subplots(figsize=(14, 5))
     x = np.arange(len(top_df))
 
-    ax.bar(x - 0.2, top_df["z_today"], width=0.4, label="今天的z_score")
-    ax.bar(x + 0.2, -top_df["trigger_zscore"], width=0.4, label="專屬觸發區間上界")
+    ax.bar(x - 0.2, top_df["z_yesterday"], width=0.4, label="昨天的z_score")
+    ax.bar(x + 0.2, top_df["trigger_zscore"], width=0.4, label="專屬觸發區間上界")
 
     ax.set_xticks(x)
     ax.set_xticklabels(top_df["symbol"], rotation=45)
     ax.set_ylabel("z_score")
     ax.legend()
-    ax.set_title("前二十名ETF 今日z_score與專屬觸發區間上界對照")
+    ax.set_title(f"前{TOP_N_DAILY}名ETF 昨日z_score與專屬觸發區間上界對照")
 
     return fig
 
@@ -182,7 +205,7 @@ def plot_top_etfs(top_df):
 # ---------------- 主介面 ----------------
 def main():
     st.title("ETF反彈選股模型")
-    st.caption("手動觸發 不會自動排程執行")
+    st.caption("手動觸發 不會自動排程執行 訊號用昨天收盤對昨天開盤算出 可在今天開盤前盤前掛單")
 
     candidates_df, candidates_path = load_candidates()
 
@@ -208,7 +231,7 @@ def main():
                         "symbol": "代碼",
                         "trigger_zscore": "專屬觸發區間下界門檻(Z值)",
                         "optimal_days": "最佳持有天數",
-                        "best_rebound_ratio": "最佳反彈報酬率",
+                        "best_rebound_ratio": "最佳反彈報酬率(預測)",
                         "event_count": "歷史事件次數",
                         "listing_years": "上市年限",
                         "annualized_volatility": "年化波動率"
@@ -219,8 +242,8 @@ def main():
     # ---- 分頁二 每日分析 ----
     with tab2:
         st.subheader("執行每日分析")
-        st.write(f"按下按鈕後 會對所有候選ETF抓取最新資料 找出當日z_score落在自己專屬觸發區間內或最接近的前{TOP_N_DAILY}名")
-        st.caption("提醒 距離最近不代表這支ETF在其他區間下不會有更好的表現 只代表今天的狀況最接近它歷史上表現最好的那個區間")
+        st.write(f"按下按鈕後 會對所有候選ETF抓取最新資料 找出昨日z_score落在自己專屬觸發區間內或最接近的前{TOP_N_DAILY}名")
+        st.caption("提醒 距離最近不代表這支ETF買進後一定會反彈 只代表昨天的狀況最接近它歷史上表現最好的那個區間")
 
         if st.button("開始分析"):
             progress_bar = st.progress(0.0)
@@ -235,36 +258,42 @@ def main():
             snapshot_path = save_snapshot(result_df)
             st.write(f"完整結果已存到 {snapshot_path}")
 
+            # z_yesterday不可以是正的 正代表昨天其實是上漲 不符合找下跌後反彈訊號的前提 這種股票不列入候選
+            # 舉例 某支ETF昨天z_yesterday是0.25 代表昨天收盤比開盤還高 即使distance數字小也要排除
+            down_only_df = result_df[result_df["z_yesterday"] < 0].copy()
+
             # 取距離最小的前TOP_N_DAILY名 再依照原始排名重新排序並標記新名次
-            top_df = result_df.sort_values("distance").head(TOP_N_DAILY).copy()
+            top_df = down_only_df.sort_values("distance").head(TOP_N_DAILY).copy()
             top_df = top_df.sort_values("original_rank").reset_index(drop=True)
             top_df["today_rank"] = top_df.index + 1
 
             st.subheader(f"今日前{TOP_N_DAILY}名 依原始排名排序")
+            st.caption("以下的z_score和漲跌幅都是昨天的資料 今天開盤前可以參考這份名單盤前掛單")
             st.dataframe(
                 top_df[[
-                    "today_rank", "original_rank", "symbol", "category", "z_today",
-                    "trigger_zscore", "distance", "optimal_days", "best_rebound_ratio", "today_return"
+                    "today_rank", "original_rank", "symbol", "category", "z_yesterday",
+                    "yesterday_return", "trigger_zscore", "distance", "optimal_days",
+                    "best_rebound_ratio"
                 ]].rename(columns={
                     "today_rank": "今日名次",
                     "original_rank": "原始排名",
                     "symbol": "代碼",
                     "category": "ETF類別",
-                    "z_today": "今日z_score",
+                    "z_yesterday": "昨日z_score",
+                    "yesterday_return": "昨日漲跌幅",
                     "trigger_zscore": "專屬觸發區間下界門檻(Z值)",
                     "distance": "距離",
                     "optimal_days": "最佳持有天數",
-                    "best_rebound_ratio": "最佳反彈報酬率",
-                    "today_return": "今日開盤對昨收報酬率"
+                    "best_rebound_ratio": "最佳反彈報酬率(預測)"
                 }),
                 use_container_width=True
             )
 
-            st.subheader(f"今日z_score與專屬觸發區間上界對照圖")
+            st.subheader("昨日z_score與專屬觸發區間上界對照圖")
             fig = plot_top_etfs(top_df)
             st.pyplot(fig)
 
-            st.subheader(f"完整{len(candidates_df)}支ETF今日狀態")
+            st.subheader(f"完整{len(candidates_df)}支ETF昨日狀態")
             st.dataframe(result_df.sort_values("distance"), use_container_width=True)
 
 

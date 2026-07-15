@@ -3,6 +3,15 @@
 # 第一步先用低波動率定義對universe.csv做預篩選 只留下真正廣泛分散 沒有槓桿反向 沒有限定單一國家或產業的ETF
 # 第二步對通過預篩選的ETF各自做grid search
 # 找出讓best_rebound_ratio最大的專屬觸發門檻(trigger_zscore)和最佳持有天數(optimal_days)
+#
+# 這一版把訊號的定義從"今天開盤對昨天收盤的跳空缺口"改成"當天收盤對當天開盤的當日內漲跌"
+# 原因是跳空缺口要等今天開盤才知道 來不及盤前下單
+# 當日內漲跌昨天收盤後就已經確定 可以在今天開盤前用這個訊號盤前掛單 用今天的開盤價買進
+#
+# 舉例 禮拜一這支ETF開盤100元 收盤95元 當天收盤對開盤的return就是95/100等於0.95
+# 如果這個return算出來的z_score夠負 落在某支ETF專屬的觸發區間裡 就代表禮拜一是一次訊號事件
+# 這時候會在禮拜二開盤前掛單 用禮拜二的開盤價買進 這就是rebound欄位裡的進場價
+#
 # 波動率篩選也在grid search這一步做 用的是過去10年的資料 不是ETF上市以來的全部資料
 # 這樣可以排除掉ETF剛上市那幾年通常比較不穩定 不確定性較高的時期
 # 目前main()會把完成grid search的全部ETF直接存檔 檔名依照實際數量命名 例如candidates_194.csv
@@ -19,13 +28,13 @@ import time
 # 回顧幾年的歷史資料 這裡用10年 這個範圍同時也是排除掉ETF剛上市時期的依據
 LOOKBACK_YEARS = 10
 
-# 最佳持有天數的搜尋範圍 這裡搜尋1到3天 找下跌後第幾天賣出反彈報酬最高
+# 最佳持有天數的搜尋範圍 這裡搜尋1到3天 找進場後第幾天賣出反彈報酬最高
 DAYS_MAX = 3
 
-# 觸發門檻(z_score)的搜尋範圍
-# 舉例 觸發門檻是2 代表只挑z_score落在負的3(不含)到負的2(含)這個區間的日子 不是門檻以下全部累加
+# 觸發門檻(z_score)的搜尋範圍 這裡直接用負值 因為我們找的是下跌事件 負號更能直接反映這個意義
+# 舉例 觸發門檻是負2 代表只挑z_score落在負3(不含)到負2(含)這個區間的日子 不是門檻以下全部累加
 # 這個grid乘以DAYS_MAX共6乘3等於18種組合 每支ETF都會逐一試過這18組 取best_rebound_ratio最高的那一組
-TRIGGER_ZSCORE_GRID = [1, 1.5, 2, 2.5, 3, 3.5]
+TRIGGER_ZSCORE_GRID = [-1, -1.5, -2, -2.5, -3, -3.5]
 
 # 最少事件數 一個觸發門檻區間如果篩出的下跌事件少於這個數字就不採用
 # 這是為了避免用只發生兩三次的極端事件去推論一個穩定的專屬參數 造成過度配適
@@ -37,7 +46,7 @@ MIN_EVENTS = 8
 VOLATILITY_THRESHOLD = 0.6
 
 # 極端值過濾門檻 初步z_score絕對值超過這個數字的日期會被排除 不參與統計基準的計算
-# 舉例 某天因為除息或財報跳空 return算出來的初步z_score是5.2 這種日子會被排除
+# 舉例 某天財報公布後盤中大幅震盪 return算出來的初步z_score是5.2 這種日子會被排除
 # 排除後用剩下的資料重新算一次mean和std 這組修正過的統計基準才會拿去用在grid search和每日分析
 EXTREME_Z_THRESHOLD = 4
 
@@ -128,7 +137,7 @@ def find_best_params_for_etf(symbol, listing_years):
         # 資料太少代表可能剛上市或資料有問題 直接跳過
         return None
 
-    # ---- 波動率篩選 用過去10年收盤對收盤的日報酬計算年化波動率 ----
+    # ---- 波動率篩選 用過去10年收盤對收盤的日報酬計算年化波動率 這個指標不受下面return定義改變影響 ----
     close_return = hist["Close"].pct_change().dropna()
     annualized_volatility = close_return.std() * np.sqrt(252)
 
@@ -138,16 +147,17 @@ def find_best_params_for_etf(symbol, listing_years):
     # ---- 準備grid search用的資料 ----
     data = hist[["Close", "High", "Open"]].copy()
 
-    # 計算每日的開盤對前一日收盤的報酬率 這是用來偵測下跌事件的訊號
-    # 舉例 昨天收盤100元 今天開盤97元 這裡算出來的return就是0.97
-    data["return"] = data["Open"] / data["Close"].shift(1)
+    # 計算每個交易日當天收盤對當天開盤的報酬率 這是用來偵測下跌事件的訊號
+    # 舉例 今天開盤100元 收盤95元 這裡算出來的return就是0.95
+    # 這跟以前用開盤對前一日收盤的算法不同 現在完全不看前一天的資料 只看當天自己開盤到收盤怎麼走
+    data["return"] = data["Close"] / data["Open"]
     data.dropna(subset=["return"], inplace=True)
 
     if len(data) < 500:
         return None
 
     # ---- 極端值過濾 先用全部資料算一次初步統計基準 ----
-    # 舉例 某天除息跳空 return算出來的初步raw_z絕對值是5.2 超過EXTREME_Z_THRESHOLD=4 這天會被排除
+    # 舉例 某天財報公布盤中大幅震盪 return算出來的初步raw_z絕對值是5.2 超過EXTREME_Z_THRESHOLD=4 這天會被排除
     raw_mean = data["return"].mean()
     raw_std = data["return"].std()
 
@@ -175,18 +185,24 @@ def find_best_params_for_etf(symbol, listing_years):
 
     total_trading_days = len(data)
 
-    # 預先算好未來1到DAYS_MAX天的反彈報酬率
-    # 舉例 rebound_2欄位的意思是 從今天收盤買進 持有到未來第2天開盤賣出的報酬率
+    # 進場價是訊號隔天的開盤價 也就是你會在盤前掛單買進的那個價格
+    # 舉例 禮拜一收盤對開盤跌了一大截觸發訊號 禮拜二開盤前掛單 用禮拜二的開盤價買進 這就是entry_price
+    entry_price = data["Open"].shift(-1)
+
+    # 預先算好持有1到DAYS_MAX天之後在開盤賣出的報酬率
+    # 舉例 rebound_2欄位的意思是 用禮拜二開盤價買進 持有2個交易日 在禮拜四開盤賣出的報酬率
     for day in range(1, DAYS_MAX + 1):
-        data[f"rebound_{day}"] = data["Open"].shift(-day) / data["Close"]
+        exit_price = data["Open"].shift(-(day + 1))
+        data[f"rebound_{day}"] = exit_price / entry_price
 
     best_combo = None  # 格式是 (trigger_zscore, optimal_days, best_ratio, event_count)
 
     for trigger_zscore in TRIGGER_ZSCORE_GRID:
-        # 找出z_score落在這個下跌區間內的日期 用區間分箱 不是門檻以下全部累加
-        # 舉例 trigger_zscore是2 區間就是負的3(不含)到負的2(含) 只抓落在這個區間的日子
-        lower_bound = -(trigger_zscore + 1)
-        upper_bound = -trigger_zscore
+        # trigger_zscore本身就是負的 代表區間裡離0最近的那條邊(上界)
+        # 區間裡離0最遠 跌更多的那條邊(下界)是trigger_zscore再減1
+        # 舉例 trigger_zscore是負2 區間就是負3(不含)到負2(含) 只抓落在這個區間的日子
+        lower_bound = trigger_zscore - 1
+        upper_bound = trigger_zscore
         drop_mask = (data["z"] > lower_bound) & (data["z"] <= upper_bound)
         event_count = int(drop_mask.sum())
 
@@ -217,14 +233,14 @@ def find_best_params_for_etf(symbol, listing_years):
         "listing_years": listing_years,
         "annualized_volatility": round(float(annualized_volatility), 4),
         # 這支ETF專屬的觸發門檻和最佳持有天數 是grid search在過去10年資料裡找出的最佳區間組合
-        # 注意這裡用float而不是int 因為grid裡有1.5 2.5 3.5這種非整數值 用int會被錯誤截斷成1或2
+        # trigger_zscore這裡已經是負值 不用再另外加負號
         "trigger_zscore": float(trigger_zscore),
         "optimal_days": int(optimal_days),
         "best_rebound_ratio": round(float(best_ratio), 4),
         "event_count": int(event_count),
         "total_trading_days": int(total_trading_days),
-        # 這兩個欄位是過濾掉極端值之後 這支ETF過去10年return的平均值和標準差
-        # 每日分析時要用同一套統計基準去算今天的z_score 才會跟這裡的定義一致
+        # 這兩個欄位是過濾掉極端值之後 這支ETF過去10年當日收盤對開盤報酬的平均值和標準差
+        # 每日分析時要用同一套統計基準去算昨天的z_score 才會跟這裡的定義一致
         "return_mean": round(float(return_mean), 6),
         "return_std": round(float(return_std), 6)
     }
